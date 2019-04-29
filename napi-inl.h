@@ -2815,8 +2815,12 @@ inline ObjectWrap<T>::ObjectWrap(const Napi::CallbackInfo& callbackInfo) {
 
 template <typename T>
 inline ObjectWrap<T>::~ObjectWrap() {
+  // If the JS object still exists at this point, remove the finalizer added
+  // through `napi_wrap()`.
   if (!IsEmpty()) {
     Object object = Value();
+    // It is not valid to call `napi_remove_wrap()` with an empty `object`.
+    // This happens e.g. during garbage collection.
     if (!object.IsEmpty())
       napi_remove_wrap(Env(), object, nullptr);
   }
