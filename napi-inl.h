@@ -2816,8 +2816,11 @@ inline ObjectWrap<T>::ObjectWrap(const Napi::CallbackInfo& callbackInfo) {
 
 template <typename T>
 inline ObjectWrap<T>::~ObjectWrap() {
-  if (!IsEmpty())
-    napi_remove_wrap(Env(), Value(), nullptr);
+  if (!IsEmpty()) {
+    Object object = Value();
+    if (!object.IsEmpty())
+      napi_remove_wrap(Env(), object, nullptr);
+  }
 }
 
 template<typename T>
