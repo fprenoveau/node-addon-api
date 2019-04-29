@@ -34,6 +34,7 @@
         'promise.cc',
         'typedarray.cc',
         'objectwrap.cc',
+        'objectwrap-removewrap.cc',
         'objectreference.cc',
         'version_management.cc',
         'thunking_manual.cc',

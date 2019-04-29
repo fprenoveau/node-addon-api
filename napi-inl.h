@@ -2814,6 +2814,12 @@ inline ObjectWrap<T>::ObjectWrap(const Napi::CallbackInfo& callbackInfo) {
   *instanceRef = Reference<Object>(env, ref);
 }
 
+template <typename T>
+inline ObjectWrap<T>::~ObjectWrap() {
+  if (!IsEmpty())
+    napi_remove_wrap(Env(), Value(), nullptr);
+}
+
 template<typename T>
 inline T* ObjectWrap<T>::Unwrap(Object wrapper) {
   T* unwrapped;

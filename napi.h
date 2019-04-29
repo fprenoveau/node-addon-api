@@ -1569,6 +1569,7 @@ namespace Napi {
   class ObjectWrap : public Reference<Object> {
   public:
     ObjectWrap(const CallbackInfo& callbackInfo);
+    ~ObjectWrap();
 
     static T* Unwrap(Object wrapper);
 
