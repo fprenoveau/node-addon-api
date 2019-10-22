@@ -1825,6 +1825,9 @@ inline Object Function::New(size_t argc, const napi_value* args) const {
   napi_value result;
   napi_status status = napi_new_instance(
     _env, _value, argc, args, &result);
+  if (Env().IsExceptionPending()) {
+    return Object();
+  }
   NAPI_THROW_IF_FAILED(_env, status, Object());
   return Object(_env, result);
 }
