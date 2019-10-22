@@ -2920,16 +2920,25 @@ inline ObjectWrap<T>::ObjectWrap(const Napi::CallbackInfo& callbackInfo) {
   napi_value wrapper = callbackInfo.This();
   napi_status status;
   napi_ref ref;
-  T* instance = static_cast<T*>(this);
-  status = napi_wrap(env, wrapper, instance, FinalizeCallback, nullptr, &ref);
+  status = napi_wrap(env, wrapper, this, FinalizeCallback, nullptr, &ref);
   NAPI_THROW_IF_FAILED_VOID(env, status);
 
-  Reference<Object>* instanceRef = instance;
+  Reference<Object>* instanceRef = this;
   *instanceRef = Reference<Object>(env, ref);
 }
 
-template<typename T>
-inline ObjectWrap<T>::~ObjectWrap() {}
+template <typename T>
+inline ObjectWrap<T>::~ObjectWrap() {
+  // If the JS object still exists at this point, remove the finalizer added
+  // through `napi_wrap()`.
+  if (!IsEmpty()) {
+    Object object = Value();
+    // It is not valid to call `napi_remove_wrap()` with an empty `object`.
+    // This happens e.g. during garbage collection.
+    if (!object.IsEmpty())
+      napi_remove_wrap(Env(), object, nullptr);
+  }
+}
 
 template<typename T>
 inline T* ObjectWrap<T>::Unwrap(Object wrapper) {
@@ -3449,7 +3458,7 @@ inline napi_value ObjectWrap<T>::InstanceSetterCallbackWrapper(
 
 template <typename T>
 inline void ObjectWrap<T>::FinalizeCallback(napi_env env, void* data, void* /*hint*/) {
-  T* instance = reinterpret_cast<T*>(data);
+  ObjectWrap<T>* instance = static_cast<ObjectWrap<T>*>(data);
   instance->Finalize(Napi::Env(env));
   delete instance;
 }

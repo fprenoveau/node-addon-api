@@ -42,6 +42,7 @@ let testModules = [
   'typedarray',
   'typedarray-bigint',
   'objectwrap',
+  'objectwrap-removewrap',
   'objectreference',
   'version_management'
 ];
