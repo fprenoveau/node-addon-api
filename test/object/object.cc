@@ -32,6 +32,10 @@ Value HasPropertyWithNapiWrapperValue(const CallbackInfo& info);
 Value HasPropertyWithCStyleString(const CallbackInfo& info);
 Value HasPropertyWithCppStyleString(const CallbackInfo& info);
 
+// Native wrappers for testing Object::AddFinalizer()
+Value AddFinalizer(const CallbackInfo& info);
+Value AddFinalizerWithHint(const CallbackInfo& info);
+
 static bool testValue = true;
 // Used to test void* Data() integrity
 struct UserDataHolder {
@@ -60,6 +64,11 @@ Value TestFunction(const CallbackInfo& info) {
    return Boolean::New(info.Env(), true);
 }
 
+Value TestFunctionWithUserData(const CallbackInfo& info) {
+  UserDataHolder* holder = reinterpret_cast<UserDataHolder*>(info.Data());
+  return Number::New(info.Env(), holder->value);
+}
+
 Array GetPropertyNames(const CallbackInfo& info) {
   Object obj = info[0].As<Object>();
   Array arr = obj.GetPropertyNames();
@@ -81,11 +90,26 @@ void DefineProperties(const CallbackInfo& info) {
       PropertyDescriptor::Accessor(env, obj, "readwriteAccessor", TestGetter, TestSetter),
       PropertyDescriptor::Accessor(env, obj, "readonlyAccessorWithUserData", TestGetterWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
       PropertyDescriptor::Accessor(env, obj, "readwriteAccessorWithUserData", TestGetterWithUserData, TestSetterWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
+
+      PropertyDescriptor::Accessor<TestGetter>("readonlyAccessorT"),
+      PropertyDescriptor::Accessor<TestGetter, TestSetter>(
+          "readwriteAccessorT"),
+      PropertyDescriptor::Accessor<TestGetterWithUserData>(
+          "readonlyAccessorWithUserDataT",
+          napi_property_attributes::napi_default,
+          reinterpret_cast<void*>(holder)),
+      PropertyDescriptor::Accessor<
+          TestGetterWithUserData,
+          TestSetterWithUserData>("readwriteAccessorWithUserDataT",
+                                  napi_property_attributes::napi_default,
+                                  reinterpret_cast<void*>(holder)),
+
       PropertyDescriptor::Value("readonlyValue", trueValue),
       PropertyDescriptor::Value("readwriteValue", trueValue, napi_writable),
       PropertyDescriptor::Value("enumerableValue", trueValue, napi_enumerable),
       PropertyDescriptor::Value("configurableValue", trueValue, napi_configurable),
       PropertyDescriptor::Function(env, obj, "function", TestFunction),
+      PropertyDescriptor::Function(env, obj, "functionWithUserData", TestFunctionWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
     });
   } else if (nameType.Utf8Value() == "string") {
     // VS2013 has lifetime issues when passing temporary objects into the constructor of another
@@ -96,22 +120,42 @@ void DefineProperties(const CallbackInfo& info) {
     std::string str2("readwriteAccessor");
     std::string str1a("readonlyAccessorWithUserData");
     std::string str2a("readwriteAccessorWithUserData");
+
+    std::string str1t("readonlyAccessorT");
+    std::string str2t("readwriteAccessorT");
+    std::string str1at("readonlyAccessorWithUserDataT");
+    std::string str2at("readwriteAccessorWithUserDataT");
+
     std::string str3("readonlyValue");
     std::string str4("readwriteValue");
     std::string str5("enumerableValue");
     std::string str6("configurableValue");
     std::string str7("function");
+    std::string str8("functionWithUserData");
 
     obj.DefineProperties({
       PropertyDescriptor::Accessor(env, obj, str1, TestGetter),
       PropertyDescriptor::Accessor(env, obj, str2, TestGetter, TestSetter),
       PropertyDescriptor::Accessor(env, obj, str1a, TestGetterWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
       PropertyDescriptor::Accessor(env, obj, str2a, TestGetterWithUserData, TestSetterWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
+
+      PropertyDescriptor::Accessor<TestGetter>(str1t),
+      PropertyDescriptor::Accessor<TestGetter, TestSetter>(str2t),
+      PropertyDescriptor::Accessor<TestGetterWithUserData>(str1at,
+                                         napi_property_attributes::napi_default,
+                                         reinterpret_cast<void*>(holder)),
+      PropertyDescriptor::Accessor<
+          TestGetterWithUserData,
+          TestSetterWithUserData>(str2at,
+                                  napi_property_attributes::napi_default,
+                                  reinterpret_cast<void*>(holder)),
+
       PropertyDescriptor::Value(str3, trueValue),
       PropertyDescriptor::Value(str4, trueValue, napi_writable),
       PropertyDescriptor::Value(str5, trueValue, napi_enumerable),
       PropertyDescriptor::Value(str6, trueValue, napi_configurable),
       PropertyDescriptor::Function(env, obj, str7, TestFunction),
+      PropertyDescriptor::Function(env, obj, str8, TestFunctionWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
     });
   } else if (nameType.Utf8Value() == "value") {
     obj.DefineProperties({
@@ -123,6 +167,21 @@ void DefineProperties(const CallbackInfo& info) {
         Napi::String::New(env, "readonlyAccessorWithUserData"), TestGetterWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
       PropertyDescriptor::Accessor(env, obj,
         Napi::String::New(env, "readwriteAccessorWithUserData"), TestGetterWithUserData, TestSetterWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
+
+      PropertyDescriptor::Accessor<TestGetter>(
+                                   Napi::String::New(env, "readonlyAccessorT")),
+      PropertyDescriptor::Accessor<TestGetter, TestSetter>(
+                                  Napi::String::New(env, "readwriteAccessorT")),
+      PropertyDescriptor::Accessor<TestGetterWithUserData>(
+                        Napi::String::New(env, "readonlyAccessorWithUserDataT"),
+                        napi_property_attributes::napi_default,
+                        reinterpret_cast<void*>(holder)),
+      PropertyDescriptor::Accessor<
+          TestGetterWithUserData, TestSetterWithUserData>(
+                       Napi::String::New(env, "readwriteAccessorWithUserDataT"),
+                       napi_property_attributes::napi_default,
+                       reinterpret_cast<void*>(holder)),
+
       PropertyDescriptor::Value(
         Napi::String::New(env, "readonlyValue"), trueValue),
       PropertyDescriptor::Value(
@@ -133,6 +192,8 @@ void DefineProperties(const CallbackInfo& info) {
         Napi::String::New(env, "configurableValue"), trueValue, napi_configurable),
       PropertyDescriptor::Function(env, obj,
         Napi::String::New(env, "function"), TestFunction),
+      PropertyDescriptor::Function(env, obj,
+        Napi::String::New(env, "functionWithUserData"), TestFunctionWithUserData, napi_property_attributes::napi_default, reinterpret_cast<void*>(holder)),
     });
   }
 }
@@ -200,6 +261,9 @@ Object InitObject(Env env) {
   exports["hasPropertyWithCppStyleString"] = Function::New(env, HasPropertyWithCppStyleString);
 
   exports["createObjectUsingMagic"] = Function::New(env, CreateObjectUsingMagic);
+
+  exports["addFinalizer"] = Function::New(env, AddFinalizer);
+  exports["addFinalizerWithHint"] = Function::New(env, AddFinalizerWithHint);
 
   return exports;
 }

@@ -9,7 +9,9 @@
 
 // Note: Do not include this file directly! Include "napi.h" instead.
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
 
 namespace Napi {
@@ -24,16 +26,23 @@ namespace details {
 template <typename FreeType>
 static inline napi_status AttachData(napi_env env,
                                      napi_value obj,
-                                     FreeType* data) {
+                                     FreeType* data,
+                                     napi_finalize finalizer = nullptr,
+                                     void* hint = nullptr) {
+  napi_status status;
+  if (finalizer == nullptr) {
+    finalizer = [](napi_env /*env*/, void* data, void* /*hint*/) {
+      delete static_cast<FreeType*>(data);
+    };
+  }
+#if (NAPI_VERSION < 5)
   napi_value symbol, external;
-  napi_status status = napi_create_symbol(env, nullptr, &symbol);
+  status = napi_create_symbol(env, nullptr, &symbol);
   if (status == napi_ok) {
     status = napi_create_external(env,
                               data,
-                              [](napi_env /*env*/, void* data, void* /*hint*/) {
-                                delete static_cast<FreeType*>(data);
-                              },
-                              nullptr,
+                              finalizer,
+                              hint,
                               &external);
     if (status == napi_ok) {
       napi_property_descriptor desc = {
@@ -49,6 +58,9 @@ static inline napi_status AttachData(napi_env env,
       status = napi_define_properties(env, obj, 1, &desc);
     }
   }
+#else  // NAPI_VERSION >= 5
+  status = napi_add_finalizer(env, obj, data, finalizer, hint, nullptr);
+#endif
   return status;
 }
 
@@ -138,9 +150,6 @@ struct ThreadSafeFinalize {
     ThreadSafeFinalize* finalizeData =
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env));
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
@@ -154,9 +163,6 @@ struct ThreadSafeFinalize {
     ThreadSafeFinalize* finalizeData =
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env), finalizeData->data);
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
@@ -170,9 +176,6 @@ struct ThreadSafeFinalize {
     ThreadSafeFinalize* finalizeData =
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env), static_cast<ContextType*>(rawContext));
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
@@ -187,15 +190,11 @@ struct ThreadSafeFinalize {
         static_cast<ThreadSafeFinalize*>(rawFinalizeData);
     finalizeData->callback(Env(env), finalizeData->data,
         static_cast<ContextType*>(rawContext));
-    if (finalizeData->tsfn) {
-      *finalizeData->tsfn = nullptr;
-    }
     delete finalizeData;
   }
 
   FinalizerDataType* data;
   Finalizer callback;
-  napi_threadsafe_function* tsfn;
 };
 #endif
 
@@ -307,6 +306,64 @@ inline Error Env::GetAndClearPendingException() {
   return Error(_env, value);
 }
 
+inline Value Env::RunScript(const char* utf8script) {
+  String script = String::New(_env, utf8script);
+  return RunScript(script);
+}
+
+inline Value Env::RunScript(const std::string& utf8script) {
+  return RunScript(utf8script.c_str());
+}
+
+inline Value Env::RunScript(String script) {
+  napi_value result;
+  napi_status status = napi_run_script(_env, script, &result);
+  NAPI_THROW_IF_FAILED(_env, status, Undefined());
+  return Value(_env, result);
+}
+
+#if NAPI_VERSION > 5
+template <typename T, Env::Finalizer<T> fini>
+inline void Env::SetInstanceData(T* data) {
+  napi_status status =
+    napi_set_instance_data(_env, data, [](napi_env env, void* data, void*) {
+      fini(env, static_cast<T*>(data));
+    }, nullptr);
+  NAPI_THROW_IF_FAILED_VOID(_env, status);
+}
+
+template <typename DataType,
+          typename HintType,
+          Napi::Env::FinalizerWithHint<DataType, HintType> fini>
+inline void Env::SetInstanceData(DataType* data, HintType* hint) {
+  napi_status status =
+    napi_set_instance_data(_env, data,
+      [](napi_env env, void* data, void* hint) {
+        fini(env, static_cast<DataType*>(data), static_cast<HintType*>(hint));
+      }, hint);
+  NAPI_THROW_IF_FAILED_VOID(_env, status);
+}
+
+template <typename T>
+inline T* Env::GetInstanceData() {
+  void* data = nullptr;
+
+  napi_status status = napi_get_instance_data(_env, &data);
+  NAPI_THROW_IF_FAILED(_env, status, nullptr);
+
+  return static_cast<T*>(data);
+}
+
+template <typename T> void Env::DefaultFini(Env, T* data) {
+  delete data;
+}
+
+template <typename DataType, typename HintType>
+void Env::DefaultFiniWithHint(Env, DataType* data, HintType*) {
+  delete data;
+}
+#endif  // NAPI_VERSION > 5
+
 ////////////////////////////////////////////////////////////////////////////////
 // Value class
 ////////////////////////////////////////////////////////////////////////////////
@@ -371,13 +428,11 @@ inline bool Value::IsNumber() const {
   return Type() == napi_number;
 }
 
-// currently experimental guard with version of NAPI_VERSION that it is
-// released in once it is no longer experimental
-#if (NAPI_VERSION > 2147483646)
+#if NAPI_VERSION > 5
 inline bool Value::IsBigInt() const {
   return Type() == napi_bigint;
 }
-#endif  // NAPI_EXPERIMENTAL
+#endif  // NAPI_VERSION > 5
 
 #if (NAPI_VERSION > 4)
 inline bool Value::IsDate() const {
@@ -608,9 +663,7 @@ inline double Number::DoubleValue() const {
   return result;
 }
 
-// currently experimental guard with version of NAPI_VERSION that it is
-// released in once it is no longer experimental
-#if (NAPI_VERSION > 2147483646)
+#if NAPI_VERSION > 5
 ////////////////////////////////////////////////////////////////////////////////
 // BigInt Class
 ////////////////////////////////////////////////////////////////////////////////
@@ -671,7 +724,7 @@ inline void BigInt::ToWords(int* sign_bit, size_t* word_count, uint64_t* words) 
       _env, _value, sign_bit, word_count, words);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 }
-#endif  // NAPI_EXPERIMENTAL
+#endif  // NAPI_VERSION > 5
 
 #if (NAPI_VERSION > 4)
 ////////////////////////////////////////////////////////////////////////////////
@@ -1170,6 +1223,40 @@ inline bool Object::InstanceOf(const Function& constructor) const {
   return result;
 }
 
+template <typename Finalizer, typename T>
+inline void Object::AddFinalizer(Finalizer finalizeCallback, T* data) {
+  details::FinalizeData<T, Finalizer>* finalizeData =
+    new details::FinalizeData<T, Finalizer>({ finalizeCallback, nullptr });
+  napi_status status =
+      details::AttachData(_env,
+                          *this,
+                          data,
+                          details::FinalizeData<T, Finalizer>::Wrapper,
+                          finalizeData);
+  if (status != napi_ok) {
+    delete finalizeData;
+    NAPI_THROW_IF_FAILED_VOID(_env, status);
+  }
+}
+
+template <typename Finalizer, typename T, typename Hint>
+inline void Object::AddFinalizer(Finalizer finalizeCallback,
+                                 T* data,
+                                 Hint* finalizeHint) {
+  details::FinalizeData<T, Finalizer, Hint>* finalizeData =
+    new details::FinalizeData<T, Finalizer, Hint>({ finalizeCallback, finalizeHint });
+  napi_status status =
+      details::AttachData(_env,
+                          *this,
+                          data,
+                          details::FinalizeData<T, Finalizer, Hint>::WrapperWithHint,
+                          finalizeData);
+  if (status != napi_ok) {
+    delete finalizeData;
+    NAPI_THROW_IF_FAILED_VOID(_env, status);
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // External class
 ////////////////////////////////////////////////////////////////////////////////
@@ -1282,7 +1369,7 @@ inline ArrayBuffer ArrayBuffer::New(napi_env env, size_t byteLength) {
   napi_status status = napi_create_arraybuffer(env, byteLength, &data, &value);
   NAPI_THROW_IF_FAILED(env, status, ArrayBuffer());
 
-  return ArrayBuffer(env, value, data, byteLength);
+  return ArrayBuffer(env, value);
 }
 
 inline ArrayBuffer ArrayBuffer::New(napi_env env,
@@ -1293,7 +1380,7 @@ inline ArrayBuffer ArrayBuffer::New(napi_env env,
     env, externalData, byteLength, nullptr, nullptr, &value);
   NAPI_THROW_IF_FAILED(env, status, ArrayBuffer());
 
-  return ArrayBuffer(env, value, externalData, byteLength);
+  return ArrayBuffer(env, value);
 }
 
 template <typename Finalizer>
@@ -1316,7 +1403,7 @@ inline ArrayBuffer ArrayBuffer::New(napi_env env,
     NAPI_THROW_IF_FAILED(env, status, ArrayBuffer());
   }
 
-  return ArrayBuffer(env, value, externalData, byteLength);
+  return ArrayBuffer(env, value);
 }
 
 template <typename Finalizer, typename Hint>
@@ -1340,38 +1427,28 @@ inline ArrayBuffer ArrayBuffer::New(napi_env env,
     NAPI_THROW_IF_FAILED(env, status, ArrayBuffer());
   }
 
-  return ArrayBuffer(env, value, externalData, byteLength);
+  return ArrayBuffer(env, value);
 }
 
-inline ArrayBuffer::ArrayBuffer() : Object(), _data(nullptr), _length(0) {
+inline ArrayBuffer::ArrayBuffer() : Object() {
 }
 
 inline ArrayBuffer::ArrayBuffer(napi_env env, napi_value value)
-  : Object(env, value), _data(nullptr), _length(0) {
-}
-
-inline ArrayBuffer::ArrayBuffer(napi_env env, napi_value value, void* data, size_t length)
-  : Object(env, value), _data(data), _length(length) {
+  : Object(env, value) {
 }
 
 inline void* ArrayBuffer::Data() {
-  EnsureInfo();
-  return _data;
+  void* data;
+  napi_status status = napi_get_arraybuffer_info(_env, _value, &data, nullptr);
+  NAPI_THROW_IF_FAILED(_env, status, nullptr);
+  return data;
 }
 
 inline size_t ArrayBuffer::ByteLength() {
-  EnsureInfo();
-  return _length;
-}
-
-inline void ArrayBuffer::EnsureInfo() const {
-  // The ArrayBuffer instance may have been constructed from a napi_value whose
-  // length/data are not yet known. Fetch and cache these values just once,
-  // since they can never change during the lifetime of the ArrayBuffer.
-  if (_data == nullptr) {
-    napi_status status = napi_get_arraybuffer_info(_env, _value, &_data, &_length);
-    NAPI_THROW_IF_FAILED_VOID(_env, status);
-  }
+  size_t length;
+  napi_status status = napi_get_arraybuffer_info(_env, _value, nullptr, &length);
+  NAPI_THROW_IF_FAILED(_env, status, 0);
+  return length;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1587,6 +1664,10 @@ inline uint8_t TypedArray::ElementSize() const {
     case napi_float32_array:
       return 4;
     case napi_float64_array:
+#if (NAPI_VERSION > 5)
+    case napi_bigint64_array:
+    case napi_biguint64_array:
+#endif  // (NAPI_VERSION > 5)
       return 8;
     default:
       return 0;
@@ -1716,6 +1797,51 @@ CreateFunction(napi_env env,
   }
 
   return status;
+}
+
+template <Function::VoidCallback cb>
+inline Function Function::New(napi_env env, const char* utf8name, void* data) {
+  napi_value result = nullptr;
+  napi_status status = napi_create_function(
+      env, utf8name, NAPI_AUTO_LENGTH,
+      [](napi_env env, napi_callback_info info) {
+        CallbackInfo callbackInfo(env, info);
+        return details::WrapCallback([&] {
+          cb(callbackInfo);
+          return nullptr;
+        });
+      }, data, &result);
+  NAPI_THROW_IF_FAILED(env, status, Function());
+  return Function(env, result);
+}
+
+template <Function::Callback cb>
+inline Function Function::New(napi_env env, const char* utf8name, void* data) {
+  napi_value result = nullptr;
+  napi_status status = napi_create_function(
+      env, utf8name, NAPI_AUTO_LENGTH,
+      [](napi_env env, napi_callback_info info) {
+        CallbackInfo callbackInfo(env, info);
+        return details::WrapCallback([&] {
+          return cb(callbackInfo);
+        });
+      }, data, &result);
+  NAPI_THROW_IF_FAILED(env, status, Function());
+  return Function(env, result);
+}
+
+template <Function::VoidCallback cb>
+inline Function Function::New(napi_env env,
+                              const std::string& utf8name,
+                              void* data) {
+  return Function::New<cb>(env, utf8name.c_str(), data);
+}
+
+template <Function::Callback cb>
+inline Function Function::New(napi_env env,
+                              const std::string& utf8name,
+                              void* data) {
+  return Function::New<cb>(env, utf8name.c_str(), data);
 }
 
 template <typename Callable>
@@ -1992,27 +2118,25 @@ inline void Buffer<T>::EnsureInfo() const {
 inline Error Error::New(napi_env env) {
   napi_status status;
   napi_value error = nullptr;
-
+  bool is_exception_pending;
   const napi_extended_error_info* info;
+
+  // We must retrieve the last error info before doing anything else, because
+  // doing anything else will replace the last error info.
   status = napi_get_last_error_info(env, &info);
   NAPI_FATAL_IF_FAILED(status, "Error::New", "napi_get_last_error_info");
 
-  if (info->error_code == napi_pending_exception) {
+  status = napi_is_exception_pending(env, &is_exception_pending);
+  NAPI_FATAL_IF_FAILED(status, "Error::New", "napi_is_exception_pending");
+
+  // A pending exception takes precedence over any internal error status.
+  if (is_exception_pending) {
     status = napi_get_and_clear_last_exception(env, &error);
     NAPI_FATAL_IF_FAILED(status, "Error::New", "napi_get_and_clear_last_exception");
   }
   else {
     const char* error_message = info->error_message != nullptr ?
       info->error_message : "Error in native callback";
-
-    bool isExceptionPending;
-    status = napi_is_exception_pending(env, &isExceptionPending);
-    NAPI_FATAL_IF_FAILED(status, "Error::New", "napi_is_exception_pending");
-
-    if (isExceptionPending) {
-      status = napi_get_and_clear_last_exception(env, &error);
-      NAPI_FATAL_IF_FAILED(status, "Error::New", "napi_get_and_clear_last_exception");
-    }
 
     napi_value message;
     status = napi_create_string_utf8(
@@ -2075,7 +2199,7 @@ inline Error& Error::operator =(Error&& other) {
 inline Error::Error(const Error& other) : ObjectReference(other) {
 }
 
-inline Error& Error::operator =(Error& other) {
+inline Error& Error::operator =(const Error& other) {
   Reset();
 
   _env = other.Env();
@@ -2687,6 +2811,108 @@ inline void CallbackInfo::SetData(void* data) {
 // PropertyDescriptor class
 ////////////////////////////////////////////////////////////////////////////////
 
+template <typename PropertyDescriptor::GetterCallback Getter>
+PropertyDescriptor
+PropertyDescriptor::Accessor(const char* utf8name,
+                             napi_property_attributes attributes,
+                             void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+
+  desc.utf8name = utf8name;
+  desc.getter = &GetterCallbackWrapper<Getter>;
+  desc.attributes = attributes;
+  desc.data = data;
+
+  return desc;
+}
+
+template <typename PropertyDescriptor::GetterCallback Getter>
+PropertyDescriptor
+PropertyDescriptor::Accessor(const std::string& utf8name,
+                             napi_property_attributes attributes,
+                             void* data) {
+  return Accessor<Getter>(utf8name.c_str(), attributes, data);
+}
+
+template <typename PropertyDescriptor::GetterCallback Getter>
+PropertyDescriptor
+PropertyDescriptor::Accessor(Name name,
+                             napi_property_attributes attributes,
+                             void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+
+  desc.name = name;
+  desc.getter = &GetterCallbackWrapper<Getter>;
+  desc.attributes = attributes;
+  desc.data = data;
+
+  return desc;
+}
+
+template <
+typename PropertyDescriptor::GetterCallback Getter,
+typename PropertyDescriptor::SetterCallback Setter>
+PropertyDescriptor
+PropertyDescriptor::Accessor(const char* utf8name,
+                             napi_property_attributes attributes,
+                             void* data) {
+
+  napi_property_descriptor desc = napi_property_descriptor();
+
+  desc.utf8name = utf8name;
+  desc.getter = &GetterCallbackWrapper<Getter>;
+  desc.setter = &SetterCallbackWrapper<Setter>;
+  desc.attributes = attributes;
+  desc.data = data;
+
+  return desc;
+}
+
+template <
+typename PropertyDescriptor::GetterCallback Getter,
+typename PropertyDescriptor::SetterCallback Setter>
+PropertyDescriptor
+PropertyDescriptor::Accessor(const std::string& utf8name,
+                             napi_property_attributes attributes,
+                             void* data) {
+  return Accessor<Getter, Setter>(utf8name.c_str(), attributes, data);
+}
+
+template <
+typename PropertyDescriptor::GetterCallback Getter,
+typename PropertyDescriptor::SetterCallback Setter>
+PropertyDescriptor
+PropertyDescriptor::Accessor(Name name,
+                             napi_property_attributes attributes,
+                             void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+
+  desc.name = name;
+  desc.getter = &GetterCallbackWrapper<Getter>;
+  desc.setter = &SetterCallbackWrapper<Setter>;
+  desc.attributes = attributes;
+  desc.data = data;
+
+  return desc;
+}
+
+template <typename PropertyDescriptor::GetterCallback Getter>
+napi_value
+PropertyDescriptor::GetterCallbackWrapper(napi_env env,
+                                          napi_callback_info info) {
+  CallbackInfo cbInfo(env, info);
+  return Getter(cbInfo);
+}
+
+template <typename PropertyDescriptor::SetterCallback Setter>
+napi_value
+PropertyDescriptor::SetterCallbackWrapper(napi_env env,
+                                          napi_callback_info info) {
+  CallbackInfo cbInfo(env, info);
+  Setter(cbInfo);
+  return nullptr;
+}
+
 template <typename Getter>
 inline PropertyDescriptor
 PropertyDescriptor::Accessor(Napi::Env env,
@@ -2938,8 +3164,9 @@ inline ObjectWrap<T>::~ObjectWrap() {
     Object object = Value();
     // It is not valid to call `napi_remove_wrap()` with an empty `object`.
     // This happens e.g. during garbage collection.
-    if (!object.IsEmpty())
+    if (!object.IsEmpty() && _construction_failed) {
       napi_remove_wrap(Env(), object, nullptr);
+    }
   }
 }
 
@@ -3131,6 +3358,62 @@ inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticMethod(
 }
 
 template <typename T>
+template <typename ObjectWrap<T>::StaticVoidMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticMethod(
+    const char* utf8name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.utf8name = utf8name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticVoidMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticMethod(
+    Symbol name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.name = name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticMethod(
+    const char* utf8name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.utf8name = utf8name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticMethod(
+    Symbol name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.name = name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
+  return desc;
+}
+
+template <typename T>
 inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticAccessor(
     const char* utf8name,
     StaticGetterCallback getter,
@@ -3164,6 +3447,38 @@ inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticAccessor(
   desc.getter = getter != nullptr ? T::StaticGetterCallbackWrapper : nullptr;
   desc.setter = setter != nullptr ? T::StaticSetterCallbackWrapper : nullptr;
   desc.data = callbackData;
+  desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticGetterCallback getter,
+          typename ObjectWrap<T>::StaticSetterCallback setter>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticAccessor(
+    const char* utf8name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.utf8name = utf8name;
+  desc.getter = This::WrapStaticGetter(This::StaticGetterTag<getter>());
+  desc.setter = This::WrapStaticSetter(This::StaticSetterTag<setter>());
+  desc.data = data;
+  desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticGetterCallback getter,
+          typename ObjectWrap<T>::StaticSetterCallback setter>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::StaticAccessor(
+    Symbol name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.name = name;
+  desc.getter = This::WrapStaticGetter(This::StaticGetterTag<getter>());
+  desc.setter = This::WrapStaticSetter(This::StaticSetterTag<setter>());
+  desc.data = data;
   desc.attributes = static_cast<napi_property_attributes>(attributes | napi_static);
   return desc;
 }
@@ -3235,6 +3550,62 @@ inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceMethod(
 }
 
 template <typename T>
+template <typename ObjectWrap<T>::InstanceVoidMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceMethod(
+    const char* utf8name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.utf8name = utf8name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = attributes;
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceMethod(
+    const char* utf8name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.utf8name = utf8name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = attributes;
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceVoidMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceMethod(
+    Symbol name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.name = name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = attributes;
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceMethodCallback method>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceMethod(
+    Symbol name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.name = name;
+  desc.method = &ObjectWrap<T>::WrappedMethod<method>;
+  desc.data = data;
+  desc.attributes = attributes;
+  return desc;
+}
+
+template <typename T>
 inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceAccessor(
     const char* utf8name,
     InstanceGetterCallback getter,
@@ -3268,6 +3639,38 @@ inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceAccessor(
   desc.getter = getter != nullptr ? T::InstanceGetterCallbackWrapper : nullptr;
   desc.setter = setter != nullptr ? T::InstanceSetterCallbackWrapper : nullptr;
   desc.data = callbackData;
+  desc.attributes = attributes;
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceGetterCallback getter,
+          typename ObjectWrap<T>::InstanceSetterCallback setter>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceAccessor(
+    const char* utf8name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.utf8name = utf8name;
+  desc.getter = This::WrapGetter(This::GetterTag<getter>());
+  desc.setter = This::WrapSetter(This::SetterTag<setter>());
+  desc.data = data;
+  desc.attributes = attributes;
+  return desc;
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceGetterCallback getter,
+          typename ObjectWrap<T>::InstanceSetterCallback setter>
+inline ClassPropertyDescriptor<T> ObjectWrap<T>::InstanceAccessor(
+    Symbol name,
+    napi_property_attributes attributes,
+    void* data) {
+  napi_property_descriptor desc = napi_property_descriptor();
+  desc.name = name;
+  desc.getter = This::WrapGetter(This::GetterTag<getter>());
+  desc.setter = This::WrapSetter(This::SetterTag<setter>());
+  desc.data = data;
   desc.attributes = attributes;
   return desc;
 }
@@ -3333,10 +3736,21 @@ inline napi_value ObjectWrap<T>::ConstructorCallbackWrapper(
     return nullptr;
   }
 
-  T* instance;
   napi_value wrapper = details::WrapCallback([&] {
     CallbackInfo callbackInfo(env, info);
-    instance = new T(callbackInfo);
+    T* instance = new T(callbackInfo);
+#ifdef NAPI_CPP_EXCEPTIONS
+    instance->_construction_failed = false;
+#else
+    if (callbackInfo.Env().IsExceptionPending()) {
+      // We need to clear the exception so that removing the wrap might work.
+      Error e = callbackInfo.Env().GetAndClearPendingException();
+      delete instance;
+      e.ThrowAsJavaScriptException();
+    } else {
+      instance->_construction_failed = false;
+    }
+# endif  // NAPI_CPP_EXCEPTIONS
     return callbackInfo.This();
   });
 
@@ -3466,6 +3880,65 @@ inline void ObjectWrap<T>::FinalizeCallback(napi_env env, void* data, void* /*hi
   delete instance;
 }
 
+template <typename T>
+template <typename ObjectWrap<T>::StaticVoidMethodCallback method>
+inline napi_value ObjectWrap<T>::WrappedMethod(napi_env env, napi_callback_info info) noexcept {
+  return details::WrapCallback([&] {
+    method(CallbackInfo(env, info));
+    return nullptr;
+  });
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticMethodCallback method>
+inline napi_value ObjectWrap<T>::WrappedMethod(napi_env env, napi_callback_info info) noexcept {
+  return details::WrapCallback([&] {
+    return method(CallbackInfo(env, info));
+  });
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceVoidMethodCallback method>
+inline napi_value ObjectWrap<T>::WrappedMethod(napi_env env, napi_callback_info info) noexcept {
+  return details::WrapCallback([&] {
+    const CallbackInfo cbInfo(env, info);
+    T* instance = Unwrap(cbInfo.This().As<Object>());
+    (instance->*method)(cbInfo);
+    return nullptr;
+  });
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceMethodCallback method>
+inline napi_value ObjectWrap<T>::WrappedMethod(napi_env env, napi_callback_info info) noexcept {
+  return details::WrapCallback([&] {
+    const CallbackInfo cbInfo(env, info);
+    T* instance = Unwrap(cbInfo.This().As<Object>());
+    return (instance->*method)(cbInfo);
+  });
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::StaticSetterCallback method>
+inline napi_value ObjectWrap<T>::WrappedMethod(napi_env env, napi_callback_info info) noexcept {
+  return details::WrapCallback([&] {
+    const CallbackInfo cbInfo(env, info);
+    method(cbInfo, cbInfo[0]);
+    return nullptr;
+  });
+}
+
+template <typename T>
+template <typename ObjectWrap<T>::InstanceSetterCallback method>
+inline napi_value ObjectWrap<T>::WrappedMethod(napi_env env, napi_callback_info info) noexcept {
+  return details::WrapCallback([&] {
+    const CallbackInfo cbInfo(env, info);
+    T* instance = Unwrap(cbInfo.This().As<Object>());
+    (instance->*method)(cbInfo, cbInfo[0]);
+    return nullptr;
+  });
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // HandleScope class
 ////////////////////////////////////////////////////////////////////////////////
@@ -3480,7 +3953,10 @@ inline HandleScope::HandleScope(Napi::Env env) : _env(env) {
 }
 
 inline HandleScope::~HandleScope() {
-  napi_close_handle_scope(_env, _scope);
+  napi_status status = napi_close_handle_scope(_env, _scope);
+  NAPI_FATAL_IF_FAILED(status,
+                       "HandleScope::~HandleScope",
+                       "napi_close_handle_scope");
 }
 
 inline HandleScope::operator napi_handle_scope() const {
@@ -3505,7 +3981,10 @@ inline EscapableHandleScope::EscapableHandleScope(Napi::Env env) : _env(env) {
 }
 
 inline EscapableHandleScope::~EscapableHandleScope() {
-  napi_close_escapable_handle_scope(_env, _scope);
+  napi_status status = napi_close_escapable_handle_scope(_env, _scope);
+  NAPI_FATAL_IF_FAILED(status,
+                       "EscapableHandleScope::~EscapableHandleScope",
+                       "napi_close_escapable_handle_scope");
 }
 
 inline EscapableHandleScope::operator napi_escapable_handle_scope() const {
@@ -3541,7 +4020,10 @@ inline CallbackScope::CallbackScope(napi_env env, napi_async_context context)
 }
 
 inline CallbackScope::~CallbackScope() {
-  napi_close_callback_scope(_env, _scope);
+  napi_status status = napi_close_callback_scope(_env, _scope);
+  NAPI_FATAL_IF_FAILED(status,
+                       "CallbackScope::~CallbackScope",
+                       "napi_close_callback_scope");
 }
 
 inline CallbackScope::operator napi_callback_scope() const {
@@ -3601,6 +4083,10 @@ inline AsyncContext::operator napi_async_context() const {
   return _context;
 }
 
+inline Napi::Env AsyncContext::Env() const {
+  return Napi::Env(_env);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // AsyncWorker class
 ////////////////////////////////////////////////////////////////////////////////
@@ -3650,8 +4136,8 @@ inline AsyncWorker::AsyncWorker(const Object& receiver,
       _env, resource_name, NAPI_AUTO_LENGTH, &resource_id);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 
-  status = napi_create_async_work(_env, resource, resource_id, OnExecute,
-                                  OnWorkComplete, this, &_work);
+  status = napi_create_async_work(_env, resource, resource_id, OnAsyncWorkExecute,
+                                  OnAsyncWorkComplete, this, &_work);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 }
 
@@ -3676,8 +4162,8 @@ inline AsyncWorker::AsyncWorker(Napi::Env env,
       _env, resource_name, NAPI_AUTO_LENGTH, &resource_id);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 
-  status = napi_create_async_work(_env, resource, resource_id, OnExecute,
-                                  OnWorkComplete, this, &_work);
+  status = napi_create_async_work(_env, resource, resource_id, OnAsyncWorkExecute,
+                                  OnAsyncWorkComplete, this, &_work);
   NAPI_THROW_IF_FAILED_VOID(_env, status);
 }
 
@@ -3764,40 +4250,51 @@ inline void AsyncWorker::SetError(const std::string& error) {
 inline std::vector<napi_value> AsyncWorker::GetResult(Napi::Env /*env*/) {
   return {};
 }
+// The OnAsyncWorkExecute method receives an napi_env argument. However, do NOT
+// use it within this method, as it does not run on the JavaScript thread and
+// must not run any method that would cause JavaScript to run. In practice,
+// this means that almost any use of napi_env will be incorrect.
+inline void AsyncWorker::OnAsyncWorkExecute(napi_env env, void* asyncworker) {
+  AsyncWorker* self = static_cast<AsyncWorker*>(asyncworker);
+  self->OnExecute(env);
+}
 // The OnExecute method receives an napi_env argument. However, do NOT
-// use it within this method, as it does not run on the main thread and must
-// not run any method that would cause JavaScript to run. In practice, this
-// means that almost any use of napi_env will be incorrect.
-inline void AsyncWorker::OnExecute(napi_env /*DO_NOT_USE*/, void* this_pointer) {
-  AsyncWorker* self = static_cast<AsyncWorker*>(this_pointer);
+// use it within this method, as it does not run on the JavaScript thread and
+// must not run any method that would cause JavaScript to run. In practice,
+// this means that almost any use of napi_env will be incorrect.
+inline void AsyncWorker::OnExecute(Napi::Env /*DO_NOT_USE*/) {
 #ifdef NAPI_CPP_EXCEPTIONS
   try {
-    self->Execute();
+    Execute();
   } catch (const std::exception& e) {
-    self->SetError(e.what());
+    SetError(e.what());
   }
 #else // NAPI_CPP_EXCEPTIONS
-  self->Execute();
+  Execute();
 #endif // NAPI_CPP_EXCEPTIONS
 }
 
-inline void AsyncWorker::OnWorkComplete(
-    napi_env /*env*/, napi_status status, void* this_pointer) {
-  AsyncWorker* self = static_cast<AsyncWorker*>(this_pointer);
+inline void AsyncWorker::OnAsyncWorkComplete(napi_env env,
+                                             napi_status status,
+                                             void* asyncworker) {
+  AsyncWorker* self = static_cast<AsyncWorker*>(asyncworker);
+  self->OnWorkComplete(env, status);
+}
+inline void AsyncWorker::OnWorkComplete(Napi::Env /*env*/, napi_status status) {
   if (status != napi_cancelled) {
-    HandleScope scope(self->_env);
+    HandleScope scope(_env);
     details::WrapCallback([&] {
-      if (self->_error.size() == 0) {
-        self->OnOK();
+      if (_error.size() == 0) {
+        OnOK();
       }
       else {
-        self->OnError(Error::New(self->_env, self->_error));
+        OnError(Error::New(_env, _error));
       }
       return nullptr;
     });
   }
-  if (!self->_suppress_destruct) {
-    self->Destroy();
+  if (!_suppress_destruct) {
+    Destroy();
   }
 }
 
@@ -3978,33 +4475,26 @@ inline ThreadSafeFunction ThreadSafeFunction::New(napi_env env,
 }
 
 inline ThreadSafeFunction::ThreadSafeFunction()
-  : _tsfn(new napi_threadsafe_function(nullptr), _d) {
+  : _tsfn() {
 }
 
 inline ThreadSafeFunction::ThreadSafeFunction(
     napi_threadsafe_function tsfn)
-  : _tsfn(new napi_threadsafe_function(tsfn), _d) {
+  : _tsfn(tsfn) {
 }
 
-inline ThreadSafeFunction::ThreadSafeFunction(ThreadSafeFunction&& other)
-  : _tsfn(std::move(other._tsfn)) {
-  other._tsfn.reset();
-}
-
-inline ThreadSafeFunction& ThreadSafeFunction::operator =(
-    ThreadSafeFunction&& other) {
-  if (*_tsfn != nullptr) {
-    Error::Fatal("ThreadSafeFunction::operator =",
-        "You cannot assign a new TSFN because existing one is still alive.");
-    return *this;
-  }
-  _tsfn = std::move(other._tsfn);
-  other._tsfn.reset();
-  return *this;
+inline ThreadSafeFunction::operator napi_threadsafe_function() const {
+  return _tsfn;
 }
 
 inline napi_status ThreadSafeFunction::BlockingCall() const {
   return CallInternal(nullptr, napi_tsfn_blocking);
+}
+
+template <>
+inline napi_status ThreadSafeFunction::BlockingCall(
+    void* data) const {
+  return napi_call_threadsafe_function(_tsfn, data, napi_tsfn_blocking);
 }
 
 template <typename Callback>
@@ -4026,6 +4516,12 @@ inline napi_status ThreadSafeFunction::NonBlockingCall() const {
   return CallInternal(nullptr, napi_tsfn_nonblocking);
 }
 
+template <>
+inline napi_status ThreadSafeFunction::NonBlockingCall(
+    void* data) const {
+  return napi_call_threadsafe_function(_tsfn, data, napi_tsfn_nonblocking);
+}
+
 template <typename Callback>
 inline napi_status ThreadSafeFunction::NonBlockingCall(
     Callback callback) const {
@@ -4041,22 +4537,37 @@ inline napi_status ThreadSafeFunction::NonBlockingCall(
   return CallInternal(new CallbackWrapper(wrapper), napi_tsfn_nonblocking);
 }
 
+inline void ThreadSafeFunction::Ref(napi_env env) const {
+  if (_tsfn != nullptr) {
+    napi_status status = napi_ref_threadsafe_function(env, _tsfn);
+    NAPI_THROW_IF_FAILED_VOID(env, status);
+  }
+}
+
+inline void ThreadSafeFunction::Unref(napi_env env) const {
+  if (_tsfn != nullptr) {
+    napi_status status = napi_unref_threadsafe_function(env, _tsfn);
+    NAPI_THROW_IF_FAILED_VOID(env, status);
+  }
+}
+
 inline napi_status ThreadSafeFunction::Acquire() const {
-  return napi_acquire_threadsafe_function(*_tsfn);
+  return napi_acquire_threadsafe_function(_tsfn);
 }
 
 inline napi_status ThreadSafeFunction::Release() {
-  return napi_release_threadsafe_function(*_tsfn, napi_tsfn_release);
+  return napi_release_threadsafe_function(_tsfn, napi_tsfn_release);
 }
 
 inline napi_status ThreadSafeFunction::Abort() {
-  return napi_release_threadsafe_function(*_tsfn, napi_tsfn_abort);
+  return napi_release_threadsafe_function(_tsfn, napi_tsfn_abort);
 }
 
 inline ThreadSafeFunction::ConvertibleContext
 ThreadSafeFunction::GetContext() const {
   void* context;
-  napi_get_threadsafe_function_context(*_tsfn, &context);
+  napi_status status = napi_get_threadsafe_function_context(_tsfn, &context);
+  NAPI_FATAL_IF_FAILED(status, "ThreadSafeFunction::GetContext", "napi_get_threadsafe_function_context");
   return ConvertibleContext({ context });
 }
 
@@ -4079,10 +4590,10 @@ inline ThreadSafeFunction ThreadSafeFunction::New(napi_env env,
 
   ThreadSafeFunction tsfn;
   auto* finalizeData = new details::ThreadSafeFinalize<ContextType, Finalizer,
-      FinalizerDataType>({ data, finalizeCallback, tsfn._tsfn.get() });
+      FinalizerDataType>({ data, finalizeCallback });
   napi_status status = napi_create_threadsafe_function(env, callback, resource,
       Value::From(env, resourceName), maxQueueSize, initialThreadCount,
-      finalizeData, wrapper, context, CallJS, tsfn._tsfn.get());
+      finalizeData, wrapper, context, CallJS, &tsfn._tsfn);
   if (status != napi_ok) {
     delete finalizeData;
     NAPI_THROW_IF_FAILED(env, status, ThreadSafeFunction());
@@ -4095,7 +4606,7 @@ inline napi_status ThreadSafeFunction::CallInternal(
     CallbackWrapper* callbackWrapper,
     napi_threadsafe_function_call_mode mode) const {
   napi_status status = napi_call_threadsafe_function(
-      *_tsfn, callbackWrapper, mode);
+      _tsfn, callbackWrapper, mode);
   if (status != napi_ok && callbackWrapper != nullptr) {
     delete callbackWrapper;
   }
@@ -4119,6 +4630,340 @@ inline void ThreadSafeFunction::CallJS(napi_env env,
   } else if (jsCallback != nullptr) {
     Function(env, jsCallback).Call({});
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Async Progress Worker Base class
+////////////////////////////////////////////////////////////////////////////////
+template <typename DataType>
+inline AsyncProgressWorkerBase<DataType>::AsyncProgressWorkerBase(const Object& receiver,
+                                                                  const Function& callback,
+                                                                  const char* resource_name,
+                                                                  const Object& resource,
+                                                                  size_t queue_size)
+  : AsyncWorker(receiver, callback, resource_name, resource) {
+  // Fill all possible arguments to work around ambiguous ThreadSafeFunction::New signatures.
+  _tsfn = ThreadSafeFunction::New(callback.Env(),
+                                  callback,
+                                  resource,
+                                  resource_name,
+                                  queue_size,
+                                  /** initialThreadCount */ 1,
+                                  /** context */ this,
+                                  OnThreadSafeFunctionFinalize,
+                                  /** finalizeData */ this);
+}
+
+#if NAPI_VERSION > 4
+template <typename DataType>
+inline AsyncProgressWorkerBase<DataType>::AsyncProgressWorkerBase(Napi::Env env,
+                                                                  const char* resource_name,
+                                                                  const Object& resource,
+                                                                  size_t queue_size)
+  : AsyncWorker(env, resource_name, resource) {
+  // TODO: Once the changes to make the callback optional for threadsafe
+  // functions are available on all versions we can remove the dummy Function here.
+  Function callback;
+  // Fill all possible arguments to work around ambiguous ThreadSafeFunction::New signatures.
+  _tsfn = ThreadSafeFunction::New(env,
+                                  callback,
+                                  resource,
+                                  resource_name,
+                                  queue_size,
+                                  /** initialThreadCount */ 1,
+                                  /** context */ this,
+                                  OnThreadSafeFunctionFinalize,
+                                  /** finalizeData */ this);
+}
+#endif
+
+template<typename DataType>
+inline AsyncProgressWorkerBase<DataType>::~AsyncProgressWorkerBase() {
+  // Abort pending tsfn call.
+  // Don't send progress events after we've already completed.
+  // It's ok to call ThreadSafeFunction::Abort and ThreadSafeFunction::Release duplicated.
+  _tsfn.Abort();
+}
+
+template <typename DataType>
+inline void AsyncProgressWorkerBase<DataType>::OnAsyncWorkProgress(Napi::Env /* env */,
+                                Napi::Function /* jsCallback */,
+                                void* data) {
+  ThreadSafeData* tsd = static_cast<ThreadSafeData*>(data);
+  tsd->asyncprogressworker()->OnWorkProgress(tsd->data());
+}
+
+template <typename DataType>
+inline napi_status AsyncProgressWorkerBase<DataType>::NonBlockingCall(DataType* data) {
+  auto tsd = new AsyncProgressWorkerBase::ThreadSafeData(this, data);
+  return _tsfn.NonBlockingCall(tsd, OnAsyncWorkProgress);
+}
+
+template <typename DataType>
+inline void AsyncProgressWorkerBase<DataType>::OnWorkComplete(Napi::Env /* env */, napi_status status) {
+  _work_completed = true;
+  _complete_status = status;
+  _tsfn.Release();
+}
+
+template <typename DataType>
+inline void AsyncProgressWorkerBase<DataType>::OnThreadSafeFunctionFinalize(Napi::Env env, void* /* data */, AsyncProgressWorkerBase* context) {
+  if (context->_work_completed) {
+    context->AsyncWorker::OnWorkComplete(env, context->_complete_status);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Async Progress Worker class
+////////////////////////////////////////////////////////////////////////////////
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(const Function& callback)
+  : AsyncProgressWorker(callback, "generic") {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(const Function& callback,
+                                const char* resource_name)
+  : AsyncProgressWorker(callback, resource_name, Object::New(callback.Env())) {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(const Function& callback,
+                                const char* resource_name,
+                                const Object& resource)
+  : AsyncProgressWorker(Object::New(callback.Env()),
+                callback,
+                resource_name,
+                resource) {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(const Object& receiver,
+                                                   const Function& callback)
+  : AsyncProgressWorker(receiver, callback, "generic") {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(const Object& receiver,
+                                                   const Function& callback,
+                                                   const char* resource_name)
+  : AsyncProgressWorker(receiver,
+                callback,
+                resource_name,
+                Object::New(callback.Env())) {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(const Object& receiver,
+                                                   const Function& callback,
+                                                   const char* resource_name,
+                                                   const Object& resource)
+  : AsyncProgressWorkerBase(receiver, callback, resource_name, resource),
+    _asyncdata(nullptr),
+    _asyncsize(0) {
+}
+
+#if NAPI_VERSION > 4
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(Napi::Env env)
+  : AsyncProgressWorker(env, "generic") {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(Napi::Env env,
+                                                   const char* resource_name)
+  : AsyncProgressWorker(env, resource_name, Object::New(env)) {
+}
+
+template<class T>
+inline AsyncProgressWorker<T>::AsyncProgressWorker(Napi::Env env,
+                                                   const char* resource_name,
+                                                   const Object& resource)
+  : AsyncProgressWorkerBase(env, resource_name, resource),
+    _asyncdata(nullptr),
+    _asyncsize(0) {
+}
+#endif
+
+template<class T>
+inline AsyncProgressWorker<T>::~AsyncProgressWorker() {
+  {
+    std::lock_guard<std::mutex> lock(this->_mutex);
+    _asyncdata = nullptr;
+    _asyncsize = 0;
+  }
+}
+
+template<class T>
+inline void AsyncProgressWorker<T>::Execute() {
+  ExecutionProgress progress(this);
+  Execute(progress);
+}
+
+template<class T>
+inline void AsyncProgressWorker<T>::OnWorkProgress(void*) {
+  T* data;
+  size_t size;
+  {
+    std::lock_guard<std::mutex> lock(this->_mutex);
+    data = this->_asyncdata;
+    size = this->_asyncsize;
+    this->_asyncdata = nullptr;
+    this->_asyncsize = 0;
+  }
+
+  this->OnProgress(data, size);
+  delete[] data;
+}
+
+template<class T>
+inline void AsyncProgressWorker<T>::SendProgress_(const T* data, size_t count) {
+    T* new_data = new T[count];
+    std::copy(data, data + count, new_data);
+
+    T* old_data;
+    {
+      std::lock_guard<std::mutex> lock(this->_mutex);
+      old_data = _asyncdata;
+      _asyncdata = new_data;
+      _asyncsize = count;
+    }
+    this->NonBlockingCall(nullptr);
+
+    delete[] old_data;
+}
+
+template<class T>
+inline void AsyncProgressWorker<T>::Signal() const {
+  this->NonBlockingCall(static_cast<T*>(nullptr));
+}
+
+template<class T>
+inline void AsyncProgressWorker<T>::ExecutionProgress::Signal() const {
+  _worker->Signal();
+}
+
+template<class T>
+inline void AsyncProgressWorker<T>::ExecutionProgress::Send(const T* data, size_t count) const {
+  _worker->SendProgress_(data, count);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Async Progress Queue Worker class
+////////////////////////////////////////////////////////////////////////////////
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Function& callback)
+  : AsyncProgressQueueWorker(callback, "generic") {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Function& callback,
+                                                             const char* resource_name)
+  : AsyncProgressQueueWorker(callback, resource_name, Object::New(callback.Env())) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Function& callback,
+                                                             const char* resource_name,
+                                                             const Object& resource)
+  : AsyncProgressQueueWorker(Object::New(callback.Env()),
+                             callback,
+                             resource_name,
+                             resource) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Object& receiver,
+                                                             const Function& callback)
+  : AsyncProgressQueueWorker(receiver, callback, "generic") {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Object& receiver,
+                                                             const Function& callback,
+                                                             const char* resource_name)
+  : AsyncProgressQueueWorker(receiver,
+                             callback,
+                             resource_name,
+                             Object::New(callback.Env())) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(const Object& receiver,
+                                                             const Function& callback,
+                                                             const char* resource_name,
+                                                             const Object& resource)
+  : AsyncProgressWorkerBase<std::pair<T*, size_t>>(receiver, callback, resource_name, resource, /** unlimited queue size */0) {
+}
+
+#if NAPI_VERSION > 4
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(Napi::Env env)
+  : AsyncProgressQueueWorker(env, "generic") {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(Napi::Env env,
+                                const char* resource_name)
+  : AsyncProgressQueueWorker(env, resource_name, Object::New(env)) {
+}
+
+template<class T>
+inline AsyncProgressQueueWorker<T>::AsyncProgressQueueWorker(Napi::Env env,
+                                                             const char* resource_name,
+                                                             const Object& resource)
+  : AsyncProgressWorkerBase<std::pair<T*, size_t>>(env, resource_name, resource, /** unlimited queue size */0) {
+}
+#endif
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::Execute() {
+  ExecutionProgress progress(this);
+  Execute(progress);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::OnWorkProgress(std::pair<T*, size_t>* datapair) {
+  if (datapair == nullptr) {
+    return;
+  }
+
+  T *data = datapair->first;
+  size_t size = datapair->second;
+
+  this->OnProgress(data, size);
+  delete datapair;
+  delete[] data;
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::SendProgress_(const T* data, size_t count) {
+    T* new_data = new T[count];
+    std::copy(data, data + count, new_data);
+
+    auto pair = new std::pair<T*, size_t>(new_data, count);
+    this->NonBlockingCall(pair);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::Signal() const {
+  this->NonBlockingCall(nullptr);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::OnWorkComplete(Napi::Env env, napi_status status) {
+  // Draining queued items in TSFN.
+  AsyncProgressWorkerBase<std::pair<T*, size_t>>::OnWorkComplete(env, status);
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::ExecutionProgress::Signal() const {
+  _worker->Signal();
+}
+
+template<class T>
+inline void AsyncProgressQueueWorker<T>::ExecutionProgress::Send(const T* data, size_t count) const {
+  _worker->SendProgress_(data, count);
 }
 #endif
 

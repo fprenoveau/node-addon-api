@@ -1,11 +1,10 @@
+#if (NAPI_VERSION > 5)
+
 #define NAPI_EXPERIMENTAL
 #include "napi.h"
 
 using namespace Napi;
 
-// currently experimental guard with version of NAPI_VERSION that it is
-// released in once it is no longer experimental
-#if (NAPI_VERSION > 2147483646)
 namespace {
 
 Value IsLossless(const CallbackInfo& info) {

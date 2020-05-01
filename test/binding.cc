@@ -1,19 +1,23 @@
-#define NAPI_EXPERIMENTAL
 #include "napi.h"
 
 using namespace Napi;
 
+#if (NAPI_VERSION > 5)
+Object InitAddonData(Env env);
+#endif
 Object InitArrayBuffer(Env env);
 Object InitAsyncContext(Env env);
+#if (NAPI_VERSION > 3)
+Object InitAsyncProgressQueueWorker(Env env);
+Object InitAsyncProgressWorker(Env env);
+#endif
 Object InitAsyncWorker(Env env);
 Object InitPersistentAsyncWorker(Env env);
 Object InitBasicTypesArray(Env env);
 Object InitBasicTypesBoolean(Env env);
 Object InitBasicTypesNumber(Env env);
 Object InitBasicTypesValue(Env env);
-// currently experimental guard with version of NAPI_VERSION that it is
-// released in once it is no longer experimental
-#if (NAPI_VERSION > 2147483646)
+#if (NAPI_VERSION > 5)
 Object InitBigInt(Env env);
 #endif
 Object InitBuffer(Env env);
@@ -36,29 +40,40 @@ Object InitObject(Env env);
 Object InitObjectDeprecated(Env env);
 #endif // !NODE_ADDON_API_DISABLE_DEPRECATED
 Object InitPromise(Env env);
+Object InitRunScript(Env env);
 #if (NAPI_VERSION > 3)
+Object InitThreadSafeFunctionCtx(Env env);
+Object InitThreadSafeFunctionExistingTsfn(Env env);
 Object InitThreadSafeFunctionPtr(Env env);
+Object InitThreadSafeFunctionSum(Env env);
+Object InitThreadSafeFunctionUnref(Env env);
 Object InitThreadSafeFunction(Env env);
 #endif
 Object InitTypedArray(Env env);
 Object InitObjectWrap(Env env);
+Object InitObjectWrapConstructorException(Env env);
 Object InitObjectWrapRemoveWrap(Env env);
 Object InitObjectReference(Env env);
 Object InitVersionManagement(Env env);
 Object InitThunkingManual(Env env);
 
 Object Init(Env env, Object exports) {
+#if (NAPI_VERSION > 5)
+  exports.Set("addon_data", InitAddonData(env));
+#endif
   exports.Set("arraybuffer", InitArrayBuffer(env));
   exports.Set("asynccontext", InitAsyncContext(env));
+#if (NAPI_VERSION > 3)
+  exports.Set("asyncprogressqueueworker", InitAsyncProgressQueueWorker(env));
+  exports.Set("asyncprogressworker", InitAsyncProgressWorker(env));
+#endif
   exports.Set("asyncworker", InitAsyncWorker(env));
   exports.Set("persistentasyncworker", InitPersistentAsyncWorker(env));
   exports.Set("basic_types_array", InitBasicTypesArray(env));
   exports.Set("basic_types_boolean", InitBasicTypesBoolean(env));
   exports.Set("basic_types_number", InitBasicTypesNumber(env));
   exports.Set("basic_types_value", InitBasicTypesValue(env));
-// currently experimental guard with version of NAPI_VERSION that it is
-// released in once it is no longer experimental
-#if (NAPI_VERSION > 2147483646)
+#if (NAPI_VERSION > 5)
   exports.Set("bigint", InitBigInt(env));
 #endif
 #if (NAPI_VERSION > 4)
@@ -82,12 +97,19 @@ Object Init(Env env, Object exports) {
   exports.Set("object_deprecated", InitObjectDeprecated(env));
 #endif // !NODE_ADDON_API_DISABLE_DEPRECATED
   exports.Set("promise", InitPromise(env));
+  exports.Set("run_script", InitRunScript(env));
 #if (NAPI_VERSION > 3)
+  exports.Set("threadsafe_function_ctx", InitThreadSafeFunctionCtx(env));
+  exports.Set("threadsafe_function_existing_tsfn", InitThreadSafeFunctionExistingTsfn(env));
   exports.Set("threadsafe_function_ptr", InitThreadSafeFunctionPtr(env));
+  exports.Set("threadsafe_function_sum", InitThreadSafeFunctionSum(env));
+  exports.Set("threadsafe_function_unref", InitThreadSafeFunctionUnref(env));
   exports.Set("threadsafe_function", InitThreadSafeFunction(env));
 #endif
   exports.Set("typedarray", InitTypedArray(env));
   exports.Set("objectwrap", InitObjectWrap(env));
+  exports.Set("objectwrapConstructorException",
+      InitObjectWrapConstructorException(env));
   exports.Set("objectwrap_removewrap", InitObjectWrapRemoveWrap(env));
   exports.Set("objectreference", InitObjectReference(env));
   exports.Set("version_management", InitVersionManagement(env));
